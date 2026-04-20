@@ -1,8 +1,13 @@
-ARG BUILD_FROM=ghcr.io/home-assistant/aarch64-base-python:3.11-alpine3.18
+ARG BUILD_FROM
 FROM ${BUILD_FROM}
 
-RUN pip3 install --no-cache-dir tinytuya flask requests
+# Install Python and pip
+RUN apk add --no-cache python3 py3-pip
 
+# Install dependencies
+RUN pip3 install --no-cache-dir --break-system-packages tinytuya flask
+
+# Copy files
 COPY run.sh /
 COPY server.py /
 RUN chmod a+x /run.sh

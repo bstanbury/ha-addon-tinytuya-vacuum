@@ -1,12 +1,17 @@
-#!/usr/bin/with-contenv bashio
+#!/bin/sh
+set -e
 
-export DEVICE_ID=$(bashio::config 'device_id')
-export LOCAL_KEY=$(bashio::config 'local_key')
-export DEVICE_IP=$(bashio::config 'device_ip')
-export PROTOCOL=$(bashio::config 'protocol')
-export API_PORT=$(bashio::config 'api_port')
+# Read config from /data/options.json
+CONFIG=/data/options.json
 
-bashio::log.info "Starting TinyTuya Vacuum Controller"
-bashio::log.info "Device: ${DEVICE_ID} at ${DEVICE_IP} (protocol ${PROTOCOL})"
+export DEVICE_ID=$(cat $CONFIG | python3 -c "import sys,json; print(json.load(sys.stdin)['device_id'])")
+export LOCAL_KEY=$(cat $CONFIG | python3 -c "import sys,json; print(json.load(sys.stdin)['local_key'])")
+export DEVICE_IP=$(cat $CONFIG | python3 -c "import sys,json; print(json.load(sys.stdin)['device_ip'])")
+export PROTOCOL=$(cat $CONFIG | python3 -c "import sys,json; print(json.load(sys.stdin)['protocol'])")
+export API_PORT=$(cat $CONFIG | python3 -c "import sys,json; print(json.load(sys.stdin)['api_port'])")
+
+echo "[INFO] Starting TinyTuya Vacuum Controller"
+echo "[INFO] Device: ${DEVICE_ID} at ${DEVICE_IP} (protocol ${PROTOCOL})"
+echo "[INFO] API port: ${API_PORT}"
 
 exec python3 /server.py
