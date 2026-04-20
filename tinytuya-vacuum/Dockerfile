@@ -2,7 +2,7 @@ ARG BUILD_FROM
 FROM ${BUILD_FROM}
 
 # Install Python dependencies
-RUN pip3 install --no-cache-dir --break-system-packages tinytuya flask
+RUN pip3 install --no-cache-dir --break-system-packages tinytuya flask requests sseclient-py
 
 # Copy application
 COPY server.py /app/server.py

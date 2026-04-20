@@ -1,8 +1,8 @@
 {
   "name": "TinyTuya Vacuum Controller",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "slug": "tinytuya_vacuum",
-  "description": "Local Tuya control for Eufy robot vacuums. Start, stop, dock, suction control, cleaning history, and status monitoring — no cloud dependency.",
+  "description": "Event-driven local Tuya vacuum control — auto-start on departure, pattern analytics, clean suggestions.",
   "url": "https://github.com/bstanbury/ha-addon-tinytuya-vacuum",
   "arch": ["aarch64", "amd64", "armhf", "armv7", "i386"],
   "startup": "application",
@@ -15,7 +15,12 @@
     "device_ip": "",
     "protocol": "3.3",
     "api_port": 8099,
-    "history_max": 50
+    "history_max": 50,
+    "event_bus_url": "http://localhost:8092",
+    "intelligence_url": "http://localhost:8093",
+    "ha_url": "http://localhost:8123",
+    "ha_token": "",
+    "auto_clean_days": 2
   },
   "schema": {
     "device_id": "str",
@@ -23,7 +28,12 @@
     "device_ip": "str",
     "protocol": "str",
     "api_port": "int",
-    "history_max": "int"
+    "history_max": "int",
+    "event_bus_url": "str",
+    "intelligence_url": "str",
+    "ha_url": "str",
+    "ha_token": "str",
+    "auto_clean_days": "int"
   },
   "ingress": false,
   "panel_icon": "mdi:robot-vacuum"

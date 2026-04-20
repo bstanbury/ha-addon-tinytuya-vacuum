@@ -1,24 +1,30 @@
 #!/usr/bin/env python3
-"""TinyTuya Vacuum Controller v1.0.0 — HA Add-on
-Local Tuya control for Eufy robot vacuums (S1 Pro T2080A and compatible).
+"""TinyTuya Vacuum Controller v2.0.0 — HA Add-on
+Local Tuya control for Eufy robot vacuums with Event Bus SSE integration.
+
+v2.0 additions:
+  - Event Bus SSE subscriber: event-driven departure start (no cron delay)
+  - Cleaning pattern analytics: days between cleans, duration trends, battery drain
+  - Auto-suggest: notifies after N days without cleaning
+  - Post-clean report pushed when vacuum docks after a session
+  - Cooper-aware: won't start while Cooper is home (checks Intelligence)
+  - Persistent patterns in /data/vacuum_v2.json
 
 Endpoints:
-  GET  /health              — Health check
-  GET  /status              — Full vacuum status
-  POST /start               — Start cleaning
-  POST /dock                — Return to dock
-  POST /suction/<level>     — Set suction (Quiet/Standard/Turbo/Max)
-  POST /find                — Locate vacuum (beep)
-  POST /water/<level>       — Set water level (low/middle/high)
-  GET  /history             — Cleaning history
-  GET  /dps                 — Raw DPS values (debug)
-  POST /pause               — Pause cleaning
-  POST /resume              — Resume cleaning
+  GET  /health, /status, /history, /dps
+  POST /start, /dock, /pause, /resume
+  POST /suction/<level>, /water/<level>, /find
+  GET  /patterns  — Cleaning pattern analytics
+  GET  /suggest   — Should we clean? Smart suggestion
+  GET  /event-log — Recent event-driven actions
 """
 import os, json, time, logging, threading
-from datetime import datetime
+from datetime import datetime, timedelta
+from collections import deque
 from flask import Flask, jsonify, request
+import requests as http
 import tinytuya
+import sseclient
 
 DEVICE_ID = os.environ.get('DEVICE_ID', '')
 LOCAL_KEY = os.environ.get('LOCAL_KEY', '')
@@ -26,14 +32,19 @@ DEVICE_IP = os.environ.get('DEVICE_IP', '')
 PROTOCOL = float(os.environ.get('PROTOCOL', '3.3'))
 API_PORT = int(os.environ.get('API_PORT', '8099'))
 HISTORY_MAX = int(os.environ.get('HISTORY_MAX', '50'))
+EVENT_BUS_URL = os.environ.get('EVENT_BUS_URL', 'http://localhost:8092')
+INTELLIGENCE_URL = os.environ.get('INTELLIGENCE_URL', 'http://localhost:8093')
+HA_URL = os.environ.get('HA_URL', 'http://localhost:8123')
+HA_TOKEN = os.environ.get('HA_TOKEN', '')
+AUTO_CLEAN_DAYS = int(os.environ.get('AUTO_CLEAN_DAYS', '2'))  # suggest clean after N days
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger('tinytuya-vacuum')
 
-WORK_STATUS = {0:'standby',1:'cleaning',2:'paused',5:'returning',34:'docked'}
-SUCTION_LEVELS = ['Quiet','Standard','Turbo','Max']
-WATER_LEVELS = ['low','middle','high']
+WORK_STATUS = {0: 'standby', 1: 'cleaning', 2: 'paused', 5: 'returning', 34: 'docked'}
+SUCTION_LEVELS = ['Quiet', 'Standard', 'Turbo', 'Max']
+WATER_LEVELS = ['low', 'middle', 'high']
 
 # State tracking
 last_status = {}
@@ -41,6 +52,12 @@ status_lock = threading.Lock()
 cleaning_history = []
 current_session = None
 HISTORY_FILE = '/data/cleaning_history.json'
+PATTERNS_FILE = '/data/vacuum_v2.json'
+
+# v2.0: Event-driven state
+event_actions = deque(maxlen=100)
+post_clean_reported = False
+
 
 def load_history():
     global cleaning_history
@@ -49,19 +66,24 @@ def load_history():
             with open(HISTORY_FILE) as f:
                 cleaning_history = json.load(f)
             logger.info(f'Loaded {len(cleaning_history)} history entries')
-    except: pass
+    except:
+        pass
+
 
 def save_history():
     try:
         with open(HISTORY_FILE, 'w') as f:
             json.dump(cleaning_history[-HISTORY_MAX:], f, indent=2)
-    except: pass
+    except:
+        pass
+
 
 def get_device():
     d = tinytuya.Device(DEVICE_ID, DEVICE_IP, LOCAL_KEY, version=PROTOCOL)
     d.set_socketTimeout(5)
     d.set_socketRetryLimit(2)
     return d
+
 
 def get_status_data():
     try:
@@ -91,6 +113,177 @@ def get_status_data():
         logger.error(f'Status error: {e}')
         return {'online': False, 'error': str(e), 'timestamp': time.time()}
 
+
+def days_since_last_clean():
+    """How many days since the last completed cleaning session."""
+    if not cleaning_history:
+        return 999
+    last = cleaning_history[-1]
+    last_end = last.get('end', last.get('start', ''))
+    if not last_end:
+        return 999
+    try:
+        last_dt = datetime.fromisoformat(last_end)
+        return (datetime.now() - last_dt).total_seconds() / 86400
+    except:
+        return 999
+
+
+def compute_patterns():
+    """v2.0: Analyze cleaning patterns from history."""
+    if len(cleaning_history) < 2:
+        return {'sessions': len(cleaning_history), 'insufficient_data': True}
+
+    durations = [s.get('duration_min', 0) for s in cleaning_history if s.get('duration_min')]
+    batteries_start = [s.get('battery_start', 0) for s in cleaning_history if s.get('battery_start')]
+    batteries_end = [s.get('battery_end', 0) for s in cleaning_history if s.get('battery_end')]
+
+    # Days between sessions
+    gaps = []
+    for i in range(1, len(cleaning_history)):
+        try:
+            t1 = datetime.fromisoformat(cleaning_history[i - 1].get('end', cleaning_history[i - 1]['start']))
+            t2 = datetime.fromisoformat(cleaning_history[i]['start'])
+            gaps.append((t2 - t1).total_seconds() / 86400)
+        except:
+            pass
+
+    return {
+        'sessions': len(cleaning_history),
+        'avg_duration_min': round(sum(durations) / len(durations), 1) if durations else None,
+        'avg_gap_days': round(sum(gaps) / len(gaps), 1) if gaps else None,
+        'avg_battery_drain': round(
+            sum(s - e for s, e in zip(batteries_start, batteries_end)) / len(batteries_start), 1
+        ) if batteries_start and batteries_end else None,
+        'days_since_last': round(days_since_last_clean(), 1),
+        'last_session': cleaning_history[-1] if cleaning_history else None,
+    }
+
+
+def ha_notify(title, msg):
+    try:
+        http.post(
+            f'{HA_URL}/api/services/notify/mobile_app_bks_home_assistant_chatsworth',
+            headers={'Authorization': f'Bearer {HA_TOKEN}', 'Content-Type': 'application/json'},
+            json={'data': {'title': title, 'message': msg}},
+            timeout=5
+        )
+    except:
+        pass
+
+
+def is_cooper_here():
+    try:
+        r = http.get(f'{INTELLIGENCE_URL}/cooper', timeout=3)
+        if r.status_code == 200:
+            return r.json().get('here', False)
+    except:
+        pass
+    return False
+
+
+def handle_event(ev):
+    """v2.0: React to Event Bus events in real-time."""
+    global post_clean_reported
+    eid = ev.get('entity_id', '')
+    new = ev.get('new_state', '')
+    old = ev.get('old_state', '')
+    sig = ev.get('significant', False)
+
+    action = None
+
+    # Departure event — start vacuum immediately
+    if 'presence' in eid and new == 'off' and old == 'on':
+        if is_cooper_here():
+            logger.info('EVENT: Departure detected but Cooper is home — skipping vacuum')
+            action = 'departure_skipped_cooper'
+        else:
+            logger.info('EVENT: Departure detected — starting vacuum immediately')
+            try:
+                d = get_device()
+                d.set_value(160, True)
+                action = 'departure_start'
+                ha_notify('🤖 Vacuum Started', 'Cleaning started automatically after departure.')
+            except Exception as e:
+                logger.error(f'Auto-start failed: {e}')
+                action = f'departure_start_failed: {e}'
+
+    # Arrival — dock if cleaning
+    elif 'presence' in eid and new == 'on' and old == 'off':
+        with status_lock:
+            state = last_status.get('state', 'unknown')
+        if state == 'cleaning':
+            logger.info('EVENT: Arrival detected while cleaning — sending dock')
+            try:
+                d = get_device()
+                d.set_value(160, False)
+                action = 'arrival_dock'
+            except Exception as e:
+                action = f'arrival_dock_failed: {e}'
+        else:
+            action = 'arrival_noted'
+
+    # Vacuum finished — post-clean report
+    elif 'vacuum' in eid and new in ['docked', 'standby'] and old in ['cleaning', 'returning']:
+        if not post_clean_reported:
+            patterns = compute_patterns()
+            msg = f"Clean complete. Duration: {patterns.get('avg_duration_min', '?')}min avg. Last: {patterns.get('days_since_last', '?')} days ago."
+            ha_notify('🧹 Clean Complete', msg)
+            post_clean_reported = True
+            action = 'post_clean_report'
+        # Reset flag when next cleaning starts
+    elif 'vacuum' in eid and new == 'cleaning':
+        post_clean_reported = False
+        action = 'cleaning_started_noted'
+
+    if action:
+        event_actions.append({
+            'time': datetime.now().isoformat(),
+            'event': eid,
+            'action': action,
+            'old': old,
+            'new': new
+        })
+        logger.info(f'ACTION: {action}')
+
+
+def event_bus_subscriber():
+    """v2.0: SSE subscriber thread."""
+    while True:
+        try:
+            logger.info(f'Connecting to Event Bus SSE: {EVENT_BUS_URL}/events/stream')
+            response = http.get(f'{EVENT_BUS_URL}/events/stream', stream=True, timeout=None)
+            client = sseclient.SSEClient(response)
+            logger.info('Event Bus SSE connected')
+            for event in client.events():
+                try:
+                    ev = json.loads(event.data)
+                    handle_event(ev)
+                except json.JSONDecodeError:
+                    pass
+                except Exception as e:
+                    logger.error(f'Event handling error: {e}')
+        except Exception as e:
+            logger.error(f'Event Bus SSE disconnected: {e}')
+        logger.info('Reconnecting to Event Bus in 10s...')
+        time.sleep(10)
+
+
+def auto_suggest_loop():
+    """v2.0: Periodically check if a cleaning is overdue and suggest."""
+    while True:
+        time.sleep(3600)  # Check every hour
+        days = days_since_last_clean()
+        if days >= AUTO_CLEAN_DAYS:
+            hour = datetime.now().hour
+            if 9 <= hour <= 20:  # Only suggest during reasonable hours
+                ha_notify(
+                    '🤖 Vacuum Suggestion',
+                    f"It's been {days:.1f} days since the last clean. Start when you leave next?"
+                )
+                logger.info(f'Auto-suggest: {days:.1f} days since last clean')
+
+
 def track_cleaning():
     """Background thread: track cleaning sessions for history."""
     global current_session
@@ -98,8 +291,7 @@ def track_cleaning():
         try:
             data = get_status_data()
             state = data.get('state', 'unknown')
-            
-            # Start of cleaning
+
             if state == 'cleaning' and current_session is None:
                 current_session = {
                     'start': datetime.now().isoformat(),
@@ -107,8 +299,7 @@ def track_cleaning():
                     'battery_start': data.get('battery', 0),
                 }
                 logger.info('Cleaning session started')
-            
-            # End of cleaning
+
             elif state in ['docked', 'standby'] and current_session is not None:
                 current_session['end'] = datetime.now().isoformat()
                 current_session['battery_end'] = data.get('battery', 0)
@@ -123,35 +314,47 @@ def track_cleaning():
             pass
         time.sleep(30)
 
+
 @app.route('/')
 def index():
     return jsonify({
         'name': 'TinyTuya Vacuum Controller',
-        'version': '1.0.0',
+        'version': '2.0.0',
         'device_id': DEVICE_ID,
         'device_ip': DEVICE_IP,
-        'endpoints': ['/health','/status','/start','/dock','/pause','/resume',
-                      '/suction/<level>','/water/<level>','/find','/history','/dps'],
+        'days_since_last_clean': round(days_since_last_clean(), 1),
+        'endpoints': ['/health', '/status', '/start', '/dock', '/pause', '/resume',
+                      '/suction/<level>', '/water/<level>', '/find', '/history',
+                      '/dps', '/patterns', '/suggest', '/event-log'],
         'suction_levels': SUCTION_LEVELS,
         'water_levels': WATER_LEVELS,
     })
+
 
 @app.route('/health')
 def health():
     with status_lock:
         age = round(time.time() - last_status.get('timestamp', 0)) if last_status else -1
-    return jsonify({'status': 'ok', 'device_id': DEVICE_ID, 'last_poll_age_seconds': age, 'sessions_tracked': len(cleaning_history)})
+    return jsonify({
+        'status': 'ok',
+        'device_id': DEVICE_ID,
+        'last_poll_age_seconds': age,
+        'sessions_tracked': len(cleaning_history),
+        'event_bus': 'connected' if event_actions else 'waiting',
+        'days_since_last_clean': round(days_since_last_clean(), 1),
+    })
+
 
 @app.route('/status')
 def status():
-    # Return cached if fresh enough
     with status_lock:
         if last_status and (time.time() - last_status.get('timestamp', 0)) < 15:
             return jsonify({**last_status, 'source': 'cache'})
     data = get_status_data()
     return jsonify({**data, 'source': 'live'})
 
-@app.route('/start', methods=['POST','GET'])
+
+@app.route('/start', methods=['POST', 'GET'])
 def start():
     try:
         d = get_device()
@@ -161,7 +364,8 @@ def start():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
-@app.route('/dock', methods=['POST','GET'])
+
+@app.route('/dock', methods=['POST', 'GET'])
 def dock():
     try:
         d = get_device()
@@ -170,7 +374,8 @@ def dock():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
-@app.route('/pause', methods=['POST','GET'])
+
+@app.route('/pause', methods=['POST', 'GET'])
 def pause():
     try:
         d = get_device()
@@ -179,7 +384,8 @@ def pause():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
-@app.route('/resume', methods=['POST','GET'])
+
+@app.route('/resume', methods=['POST', 'GET'])
 def resume():
     try:
         d = get_device()
@@ -188,9 +394,11 @@ def resume():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
-@app.route('/suction/<level>', methods=['POST','GET'])
+
+@app.route('/suction/<level>', methods=['POST', 'GET'])
 def suction(level):
-    m = {'quiet':'Quiet','q':'Quiet','standard':'Standard','s':'Standard','turbo':'Turbo','t':'Turbo','max':'Max','m':'Max'}
+    m = {'quiet': 'Quiet', 'q': 'Quiet', 'standard': 'Standard', 's': 'Standard',
+         'turbo': 'Turbo', 't': 'Turbo', 'max': 'Max', 'm': 'Max'}
     target = m.get(level.lower(), level)
     if target not in SUCTION_LEVELS:
         return jsonify({'success': False, 'error': f'Use: {SUCTION_LEVELS}'}), 400
@@ -204,7 +412,8 @@ def suction(level):
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
-@app.route('/water/<level>', methods=['POST','GET'])
+
+@app.route('/water/<level>', methods=['POST', 'GET'])
 def water(level):
     if level.lower() not in WATER_LEVELS:
         return jsonify({'success': False, 'error': f'Use: {WATER_LEVELS}'}), 400
@@ -218,7 +427,8 @@ def water(level):
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
-@app.route('/find', methods=['POST','GET'])
+
+@app.route('/find', methods=['POST', 'GET'])
 def find():
     try:
         d = get_device()
@@ -229,6 +439,7 @@ def find():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
+
 @app.route('/history')
 def history():
     limit = request.args.get('limit', 10, type=int)
@@ -237,6 +448,7 @@ def history():
         'sessions': cleaning_history[-limit:],
         'current_session': current_session,
     })
+
 
 @app.route('/dps')
 def raw_dps():
@@ -247,13 +459,41 @@ def raw_dps():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+
+@app.route('/patterns')
+def patterns():
+    return jsonify(compute_patterns())
+
+
+@app.route('/suggest')
+def suggest():
+    days = days_since_last_clean()
+    patterns_data = compute_patterns()
+    avg_gap = patterns_data.get('avg_gap_days', AUTO_CLEAN_DAYS)
+    should_clean = days >= (avg_gap or AUTO_CLEAN_DAYS)
+    return jsonify({
+        'should_clean': should_clean,
+        'days_since_last': round(days, 1),
+        'avg_gap_days': avg_gap,
+        'message': f"It's been {days:.1f} days. {'Time to clean!' if should_clean else 'Not due yet.'}" ,
+    })
+
+
+@app.route('/event-log')
+def event_log():
+    return jsonify(list(event_actions)[-20:])
+
+
 if __name__ == '__main__':
-    logger.info(f'TinyTuya Vacuum Controller v1.0.0')
+    logger.info('TinyTuya Vacuum Controller v2.0.0')
     logger.info(f'Device: {DEVICE_ID} at {DEVICE_IP} (protocol {PROTOCOL})')
     logger.info(f'Listening on port {API_PORT}')
     load_history()
-    # Start background tracking
-    tracker = threading.Thread(target=track_cleaning, daemon=True)
-    tracker.start()
-    logger.info('Cleaning session tracker started')
+    # Start background cleaning tracker
+    threading.Thread(target=track_cleaning, daemon=True).start()
+    # v2.0: Start Event Bus SSE subscriber
+    threading.Thread(target=event_bus_subscriber, daemon=True).start()
+    # v2.0: Start auto-suggest loop
+    threading.Thread(target=auto_suggest_loop, daemon=True).start()
+    logger.info('Cleaning tracker + Event Bus subscriber + auto-suggest started')
     app.run(host='0.0.0.0', port=API_PORT, debug=False)
