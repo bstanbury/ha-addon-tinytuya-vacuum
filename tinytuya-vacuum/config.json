@@ -1,8 +1,8 @@
 {
   "name": "TinyTuya Vacuum Controller",
-  "version": "0.3.0",
+  "version": "1.0.0",
   "slug": "tinytuya_vacuum",
-  "description": "Local Tuya control for Eufy Robovac S1 Pro via REST API.",
+  "description": "Local Tuya control for Eufy robot vacuums. Start, stop, dock, suction control, cleaning history, and status monitoring — no cloud dependency.",
   "url": "https://github.com/bstanbury/ha-addon-tinytuya-vacuum",
   "arch": ["aarch64", "amd64", "armhf", "armv7", "i386"],
   "startup": "application",
@@ -14,14 +14,16 @@
     "local_key": "",
     "device_ip": "",
     "protocol": "3.3",
-    "api_port": 8099
+    "api_port": 8099,
+    "history_max": 50
   },
   "schema": {
     "device_id": "str",
     "local_key": "str",
     "device_ip": "str",
     "protocol": "str",
-    "api_port": "int"
+    "api_port": "int",
+    "history_max": "int"
   },
   "ingress": false,
   "panel_icon": "mdi:robot-vacuum"
