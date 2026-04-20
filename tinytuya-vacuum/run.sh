@@ -1,17 +1,21 @@
 #!/bin/sh
 set -e
 
-# Read config from /data/options.json
 CONFIG=/data/options.json
 
-export DEVICE_ID=$(cat $CONFIG | python3 -c "import sys,json; print(json.load(sys.stdin)['device_id'])")
-export LOCAL_KEY=$(cat $CONFIG | python3 -c "import sys,json; print(json.load(sys.stdin)['local_key'])")
-export DEVICE_IP=$(cat $CONFIG | python3 -c "import sys,json; print(json.load(sys.stdin)['device_ip'])")
-export PROTOCOL=$(cat $CONFIG | python3 -c "import sys,json; print(json.load(sys.stdin)['protocol'])")
-export API_PORT=$(cat $CONFIG | python3 -c "import sys,json; print(json.load(sys.stdin)['api_port'])")
+if [ ! -f "$CONFIG" ]; then
+    echo "[ERROR] No config file found at $CONFIG"
+    exit 1
+fi
 
-echo "[INFO] Starting TinyTuya Vacuum Controller"
+export DEVICE_ID=$(python3 -c "import json; print(json.load(open('$CONFIG'))['device_id'])")
+export LOCAL_KEY=$(python3 -c "import json; print(json.load(open('$CONFIG'))['local_key'])")
+export DEVICE_IP=$(python3 -c "import json; print(json.load(open('$CONFIG'))['device_ip'])")
+export PROTOCOL=$(python3 -c "import json; print(json.load(open('$CONFIG'))['protocol'])")
+export API_PORT=$(python3 -c "import json; print(json.load(open('$CONFIG'))['api_port'])")
+
+echo "[INFO] TinyTuya Vacuum Controller v0.3.0"
 echo "[INFO] Device: ${DEVICE_ID} at ${DEVICE_IP} (protocol ${PROTOCOL})"
 echo "[INFO] API port: ${API_PORT}"
 
-exec python3 /server.py
+exec python3 /app/server.py
